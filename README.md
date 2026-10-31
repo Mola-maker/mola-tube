@@ -12,9 +12,10 @@
 
 ## 首版包含什么
 
-- `web/`：纯静态前端，首页 / 观看页 / Agent 工作台，可直接用浏览器打开。
-- `server/`：零依赖 Node Harness 骨架，任务队列 + Worker 池 + 每任务独立工作区。
-- `docs/ARCHITECTURE.md`：高并发、独立工作区、安全隔离的设计文档。
+- `web/`：纯静态前端，首页 / 观看页 / Agent 工作台 / Agents 控制页，可直接用浏览器打开。
+- `server/`：零依赖 Node Harness，持久化队列 + 子进程 Worker 隔离 + SSE 实时控制 + 每任务独立工作区。
+- `docs/ARCHITECTURE.md` 与 `docs/ARCHITECTURE-v2.md`：高并发、独立工作区、安全隔离的设计文档。
+- `docs/REFERENCES.md`：参考调查（DeepSeek Harness、dsh-superagent-prototype、LayerFS），以及采纳与不采纳的理由。
 
 ## 快速试用
 
@@ -34,6 +35,7 @@ node server/index.mjs   # 监听 http://localhost:3000
 
 ## 路线图
 
-- v0.1（本版）：静态前端 + 本地 Harness 骨架 + 架构文档。
-- v0.2：接 molamaker_site_v2 的 CSS/动画/插图风格，替换现有主题；接真实视频源。
+- v0.1：静态前端 + 本地 Harness 骨架 + 架构文档。
+- v0.2（本版）：高并发网页控 Agents 架构——持久化队列、子进程 Worker、SSE、Agent 生命周期（开始/暂停/停止/重试/备注）。
+- v0.3：接 molamaker_site_v2 的 CSS/动画/插图风格，替换现有主题；接真实视频源。
 - v0.3：多用户账号、newapi 式多渠道支付抽象（只用于会员与增值功能，不卖刷课结果）。
