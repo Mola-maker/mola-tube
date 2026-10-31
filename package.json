@@ -1,1 +1,1 @@
-{"description":"MolaTube: self-directed learning video site with a high-concurrency web-controlled agent harness.","license":"MIT","main":"server/index.mjs","name":"molatube","scripts":{"start":"node server/index.mjs"},"type":"module","version":"1.0.0"}
+{"description":"MolaTube: self-directed learning video site with a high-concurrency web-controlled agent harness.","engines":{"node":">=24"},"license":"MIT","main":"server/index.mjs","name":"molatube","scripts":{"start":"node server/index.mjs"},"type":"module","version":"1.0.0"}

@@ -2,6 +2,11 @@
 
 # MolaTube · 自选式学习视频站 v1.2
 
+[![License: MIT](https://img.shields.io/github/license/Mola-maker/mola-tube)](LICENSE)
+[![Node >= 24](https://img.shields.io/badge/node-%3E%3D24-339933)](package.json)
+[![Zero dependencies](https://img.shields.io/badge/dependencies-0-blue)](package.json)
+[![GitHub stars](https://img.shields.io/github/stars/Mola-maker/mola-tube)](https://github.com/Mola-maker/mola-tube/stargazers)
+
 **30 秒了解：MolaTube 是什么？** 一个用户自己选、自己看的 YouTube 式学习视频站，
 配一个网页可控的高并发 Agent Harness。**适合谁？** 想按自己的节奏学视频、
 又想让 Agent 帮忙整理学习成果的人——视频由你自己挑、自己看，Agent 只在你点
@@ -15,6 +20,15 @@ npm start
 **范围规则（不变）：** 用户自己选、自己看；Agent 只做用户主动发起的辅助
 （总结、答疑、笔记、自测），不自动刷课、不代答考试、不碰任何第三方学习平台
 的账号与考试。
+
+## 截图
+
+| 首页：自己选 | 控制面板：总览 | 真实浏览器页 |
+|---|---|---|
+| ![首页](docs/screenshots/index.png) | ![控制面板](docs/screenshots/dashboard.png) | ![真实浏览器](docs/screenshots/browser.png) |
+
+截图由项目自带的真实浏览器引擎（chrome-headless-shell）直接截取本地页面，
+空状态如实呈现，未伪造任务与数据。
 
 ## v1.2：真实浏览器 + 极致优化（2026-11-01）
 
@@ -128,6 +142,17 @@ npm start
 - 不登录、不托管、不自动化任何第三方学习平台（包括学习通）。
 - 不自动播放、不代做作业、不代答考试、不绕过签到、人脸、切屏等核验。
 - 不跨用户读取工作区，不把任何凭证、会话写入日志。
+
+## 这是什么（便于搜索发现）
+
+Agent Harness · Multi-Agent · Browser Automation · CDP · headless-shell ·
+Task Queue · Concurrency · Plugin System · Dashboard · Zero Dependency。
+
+MolaTube 把三件事做在了一个零依赖的 Node 服务里：**网页可控的 Agent
+Harness**（队列 + 常驻 Worker 池 + 每任务独立工作区 + 审计日志）、
+**真实浏览器操作**（原生 CDP pipe 传输、每 Agent 独立 BrowserContext、
+浏览器池化与回收、视口 JPEG 截图、私网拦截）、**可插拔的插件与渠道**
+（本地 / Magpie 双通道、API 密钥与配额、newapi 风格控制面板）。
 
 ## 路线图
 
