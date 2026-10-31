@@ -1,13 +1,14 @@
-// MolaTube v1.0 control plane: durable state, channels, keys, quotas,
-// job queue, child-process workers, per-agent lifecycle, SSE live updates,
-// and static serving of the web/ frontend (open http://localhost:3000/).
-// Zero dependencies, Node 24.
+// MolaTube v1.2 control plane: durable state, channels, keys, quotas,
+// job queue, worker pool + fork workers, per-agent lifecycle, SSE live
+// updates, a real-browser daemon, and static serving of the web/
+// frontend (open http://localhost:3000/). Zero dependencies, Node 24.
 // Rules: user-initiated tasks only; no third-party account automation; no exam work.
 // v0.1/v0.2 /api/jobs + /api/audit shapes are kept compatible.
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
-import { fork } from "node:child_process";
+import { fork, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { initDirs, loadState, saveState, appendEvent, loadEvents, workspaceOf } from "./store.mjs";
 import { loadChannels, saveChannels, routeChannel, newChannel, CHANNEL_TYPES } from "./channels.mjs";
@@ -15,6 +16,7 @@ import { loadKeys, saveKeys, createKey, verifyKey, maskKey } from "./keys.mjs";
 import { loadQuotas, saveQuotas, getQuota, jobsToday } from "./quotas.mjs";
 import { computeStats } from "./stats.mjs";
 import { loadPlugins, allPluginDirs, findPlugin } from "./plugins.mjs";
+import { createPool } from "./pool.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_RUNNING = Number(process.env.MAX_RUNNING || 3);
@@ -23,6 +25,15 @@ const QUEUE_MAX = Number(process.env.QUEUE_MAX || 100);
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 120_000);
 const WORKER_MEM_MB = Number(process.env.WORKER_MEM_MB || 256);
 const REQUIRE_KEY = process.env.MOLATUBE_REQUIRE_KEY === "1";
+// v1.2: pool serves the local channel (magpie keeps its per-job fork +
+// envelope check). MOLATUBE_POOL=0 restores pure fork mode.
+// The real browser daemon is on unless MOLATUBE_BROWSER=0.
+const POOL_ENABLED = process.env.MOLATUBE_POOL !== "0";
+const BROWSER_ENABLED = process.env.MOLATUBE_BROWSER !== "0";
+let pool = null;
+let poolBroken = false;
+let browserDaemon = null; // {child, port, token}
+let browserStarting = null;
 const WEB_DIR = path.resolve(import.meta.dirname, "..", "web");
 
 initDirs();
@@ -119,16 +130,15 @@ function pump() {
   }
 }
 
-// Spawn one executor for a job. Local forks worker.mjs directly; magpie
-// forks magpie-runner.mjs, which schema-validates the tool-call envelope
-// and then forks the same worker. Both report progress over IPC.
-function spawnExecutor(job, channel) {
-  const dir = workspaceOf(job.id);
-  fs.mkdirSync(dir, { recursive: true });
-  const baseEnv = {
+// Shared environment for every executor (fork worker, pool worker,
+// magpie-runner, plugin-runner): plugin dirs, data dir, layerfs home and
+// the browser daemon's address + per-boot token.
+function childEnv(job, dir) {
+  return {
     PATH: process.env.PATH || "",
     MOLATUBE_JOB_ID: job.id,
     MOLATUBE_AGENT_ID: job.agentId || "",
+    MOLATUBE_USER: job.user || "demo-user",
     MOLATUBE_TYPE: job.type,
     MOLATUBE_VIDEO_ID: job.videoId,
     MOLATUBE_WORKSPACE: dir,
@@ -139,9 +149,31 @@ function spawnExecutor(job, channel) {
     MOLATUBE_ARGS_JSON: JSON.stringify(job.args || {}),
     MOLATUBE_PLUGIN_DIRS: allPluginDirs().join(":"),
     MOLATUBE_DATA_DIR: path.resolve(import.meta.dirname, "data"),
+    MOLATUBE_BROWSER_URL: browserDaemon ? `http://127.0.0.1:${browserDaemon.port}` : "",
+    MOLATUBE_BROWSER_TOKEN: browserDaemon ? browserDaemon.token : "",
     MAGPIE_LAYERFS_HOME: process.env.MAGPIE_LAYERFS_HOME || path.resolve(import.meta.dirname, "data", "layerfs-home"),
     MAGPIE_LAYERFS_PAGE_DIR: process.env.MAGPIE_LAYERFS_PAGE_DIR || path.resolve(import.meta.dirname, "data", "layerfs-page"),
   };
+}
+function poolSharedEnv() {
+  return {
+    PATH: process.env.PATH || "",
+    MOLATUBE_PLUGIN_DIRS: allPluginDirs().join(":"),
+    MOLATUBE_DATA_DIR: path.resolve(import.meta.dirname, "data"),
+    MOLATUBE_BROWSER_URL: browserDaemon ? `http://127.0.0.1:${browserDaemon.port}` : "",
+    MOLATUBE_BROWSER_TOKEN: browserDaemon ? browserDaemon.token : "",
+    MAGPIE_LAYERFS_HOME: process.env.MAGPIE_LAYERFS_HOME || path.resolve(import.meta.dirname, "data", "layerfs-home"),
+    MAGPIE_LAYERFS_PAGE_DIR: process.env.MAGPIE_LAYERFS_PAGE_DIR || path.resolve(import.meta.dirname, "data", "layerfs-page"),
+  };
+}
+
+// Spawn one executor for a job. Local jobs go to the pool when it is up
+// (magpie keeps its per-job fork + envelope check); the pool path never
+// forks per job. Both report progress over IPC.
+function spawnExecutor(job, channel) {
+  const dir = workspaceOf(job.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const baseEnv = childEnv(job, dir);
   if (channel.type === "magpie") {
     return fork(path.resolve(import.meta.dirname, "magpie-runner.mjs"), [], {
       env: { ...baseEnv, MOLATUBE_TOOL_CALL: JSON.stringify({ tool: "molatube.run_job", arguments: { type: job.type, videoId: job.videoId, question: job.question, plugin: job.plugin, tool: job.tool, args: job.args } }) },
@@ -156,31 +188,75 @@ function spawnExecutor(job, channel) {
   });
 }
 
-function startJob(job, channel) {
+function markJobRunning(job, channel) {
   setJob(job, { status: "running", channel: channel.id, startedAt: Date.now(), progress: job.progress || 0 }, { kind: "job_start", job: job.id, agent: job.agentId || null, type: job.type, video: job.videoId, user: job.user, channel: channel.id });
   if (job.agentId) {
     const agent = findAgent(job.agentId);
     if (agent && agent.status !== "stopped") setAgent(agent, { status: "working", currentJobId: job.id }, null);
   }
+}
+function handleExecutorMessage(job, channel, msg) {
+  if (job.status !== "running") return;
+  if (msg.kind === "progress") setJob(job, { progress: msg.progress, step: msg.step }, null);
+  else if (msg.kind === "done") {
+    clearTimer(job.id);
+    setJob(job, { status: "done", progress: 100, result: msg.result }, { kind: "job_done", job: job.id, agent: job.agentId || null, channel: channel.id });
+    finishAgent(job);
+  } else if (msg.kind === "cancelled") {
+    clearTimer(job.id);
+    setJob(job, { status: "cancelled" }, { kind: "job_cancelled", job: job.id, agent: job.agentId || null });
+    finishAgent(job);
+  } else if (msg.kind === "failed") {
+    clearTimer(job.id);
+    setJob(job, { status: "failed", result: msg.error || "任务失败" }, { kind: "job_failed", job: job.id, agent: job.agentId || null, channel: channel.id });
+    finishAgent(job);
+  } else if (msg.kind === "error") {
+    clearTimer(job.id);
+    setJob(job, { status: "failed", result: `通道校验失败：${msg.error}` }, { kind: "job_failed", job: job.id, agent: job.agentId || null, channel: channel.id });
+    finishAgent(job);
+  }
+}
+function armTimeout(job) {
+  const timer = setTimeout(() => {
+    if (job.status === "running") {
+      killChild(job.id);
+      setJob(job, { status: "timeout", result: "任务超时，已强行终止。" }, { kind: "job_timeout", job: job.id, agent: job.agentId || null });
+      finishAgent(job);
+      pump();
+    }
+  }, JOB_TIMEOUT_MS);
+  timers.set(job.id, timer);
+}
+const poolJobs = new Map(); // jobId -> {worker, channel}
+function startJob(job, channel) {
+  // Pool path (local channel only): an idle pool worker serves the job
+  // with plugins already loaded. No idle worker -> stay queued; the
+  // release handler pumps again. Magpie keeps its per-job fork + envelope.
+  if (channel.type !== "magpie" && POOL_ENABLED && pool && !poolBroken) {
+    const worker = pool.acquire();
+    if (!worker) return;
+    const dir = workspaceOf(job.id);
+    fs.mkdirSync(dir, { recursive: true });
+    markJobRunning(job, channel);
+    poolJobs.set(job.id, { worker, channel });
+    pool.assign(worker, job.id);
+    try {
+      worker.child.send({ kind: "run", job: { id: job.id, agentId: job.agentId || "", user: job.user, type: job.type, videoId: job.videoId, question: job.question || "", plugin: job.plugin || "", tool: job.tool || "", args: job.args || {}, workspace: dir } });
+    } catch {
+      poolJobs.delete(job.id);
+      pool.release(worker);
+      setJob(job, { status: "failed", result: "Worker 池投递失败，请重试。" }, { kind: "job_failed", job: job.id, agent: job.agentId || null });
+      finishAgent(job);
+      pump();
+      return;
+    }
+    armTimeout(job);
+    return;
+  }
+  markJobRunning(job, channel);
   const child = spawnExecutor(job, channel);
   children.set(job.id, child);
-  child.on("message", (msg) => {
-    if (job.status !== "running") return;
-    if (msg.kind === "progress") setJob(job, { progress: msg.progress, step: msg.step }, null);
-    else if (msg.kind === "done") {
-      clearTimer(job.id);
-      setJob(job, { status: "done", progress: 100, result: msg.result }, { kind: "job_done", job: job.id, agent: job.agentId || null, channel: channel.id });
-      finishAgent(job);
-    } else if (msg.kind === "cancelled") {
-      clearTimer(job.id);
-      setJob(job, { status: "cancelled" }, { kind: "job_cancelled", job: job.id, agent: job.agentId || null });
-      finishAgent(job);
-    } else if (msg.kind === "error") {
-      clearTimer(job.id);
-      setJob(job, { status: "failed", result: `通道校验失败：${msg.error}` }, { kind: "job_failed", job: job.id, agent: job.agentId || null, channel: channel.id });
-      finishAgent(job);
-    }
-  });
+  child.on("message", (msg) => handleExecutorMessage(job, channel, msg));
   child.on("exit", (code) => {
     children.delete(job.id);
     clearTimer(job.id);
@@ -197,15 +273,7 @@ function startJob(job, channel) {
       pump();
     }, 200);
   });
-  const timer = setTimeout(() => {
-    if (job.status === "running") {
-      killChild(job.id);
-      setJob(job, { status: "timeout", result: "任务超时，已强行终止。" }, { kind: "job_timeout", job: job.id, agent: job.agentId || null });
-      finishAgent(job);
-      pump();
-    }
-  }, JOB_TIMEOUT_MS);
-  timers.set(job.id, timer);
+  armTimeout(job);
 }
 
 function clearTimer(jobId) {
@@ -213,6 +281,18 @@ function clearTimer(jobId) {
   if (t) { clearTimeout(t); timers.delete(jobId); }
 }
 function killChild(jobId) {
+  const poolEntry = poolJobs.get(jobId);
+  if (poolEntry) {
+    // Pool worker: ask it to cancel between steps (shared process, never
+    // SIGTERM — that would kill the pool). Watchdog kills a stuck worker;
+    // the pool exit handler replaces it exactly once.
+    try { poolEntry.worker.child.send({ kind: "cancel" }); } catch { /* gone */ }
+    setTimeout(() => {
+      const w = pool ? pool.workerForJob(jobId) : null;
+      if (w) pool.kill(w);
+    }, 5000);
+    return;
+  }
   const child = children.get(jobId);
   if (!child) return;
   try { child.kill("SIGTERM"); } catch { /* gone */ }
@@ -285,6 +365,110 @@ function serveStatic(req, res, pathname) {
   }
 }
 
+// ---- worker pool wiring ----
+const respawnTimes = [];
+function poolRespawnGuarded() {
+  const now = Date.now();
+  respawnTimes.push(now);
+  while (respawnTimes.length && respawnTimes[0] < now - 10000) respawnTimes.shift();
+  if (respawnTimes.length > 5) {
+    poolBroken = true;
+    log({ kind: "pool_broken", note: "pool workers dying too fast, falling back to fork" });
+    return;
+  }
+  pool.respawn();
+  pump();
+}
+function setupPool() {
+  pool = createPool({
+    size: MAX_RUNNING,
+    env: poolSharedEnv(),
+    memMb: WORKER_MEM_MB,
+    onMessage: (w, msg) => {
+      if (msg.kind === "ready") { pump(); return; }
+      const terminal = ["done", "cancelled", "failed"].includes(msg.kind);
+      const job = msg.jobId ? findJob(msg.jobId) : null;
+      if (!job) {
+        // Unknown job id on a terminal message: still release the worker,
+        // or one bad id would wedge the pool slot forever.
+        if (terminal) { pool.release(w); pump(); }
+        return;
+      }
+      const entry = poolJobs.get(job.id);
+      if (terminal) { pool.release(w); poolJobs.delete(job.id); }
+      if (entry) handleExecutorMessage(job, entry.channel, msg);
+      if (terminal) pump();
+    },
+    onExit: (w, code) => {
+      const jobId = w.busyJobId;
+      if (jobId) {
+        poolJobs.delete(jobId);
+        const job = findJob(jobId);
+        if (job && job.status === "running") {
+          clearTimer(jobId);
+          setJob(job, { status: "failed", result: `Worker 池进程异常退出（code ${code}），请重试。` }, { kind: "job_failed", job: job.id, agent: job.agentId || null, code });
+          finishAgent(job);
+        }
+      }
+      poolRespawnGuarded();
+    },
+  });
+}
+
+// ---- real browser daemon ----
+function pickPort() {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)); });
+  });
+}
+async function ensureBrowserDaemon() {
+  if (browserDaemon && browserDaemon.child && !browserDaemon.child.killed) return browserDaemon;
+  if (browserStarting) return browserStarting;
+  browserStarting = (async () => {
+    const port = await pickPort();
+    const token = randomUUID();
+    const child = spawn(process.execPath, [path.resolve(import.meta.dirname, "browser-daemon.mjs")], {
+      env: {
+        ...process.env,
+        BROWSER_PORT: String(port),
+        BROWSER_TOKEN: token,
+        BROWSER_DATA_DIR: path.resolve(import.meta.dirname, "data"),
+        BROWSER_MAX_TABS: process.env.BROWSER_MAX_TABS || "8",
+        BROWSER_MAX_TABS_PER_AGENT: process.env.BROWSER_MAX_TABS_PER_AGENT || "3",
+        PATH: process.env.PATH || "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr.on("data", () => {});
+    const daemon = { child, port, token };
+    child.on("exit", () => { if (browserDaemon === daemon) browserDaemon = null; });
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) throw new Error("browser daemon exited during startup");
+      try {
+        const r = await fetch(`http://127.0.0.1:${port}/health`, { headers: { "X-Browser-Token": token } });
+        if (r.ok) { browserDaemon = daemon; return daemon; }
+      } catch { /* not up yet */ }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error("browser daemon did not come up");
+  })();
+  try { return await browserStarting; }
+  finally { browserStarting = null; }
+}
+async function daemonCall(method, p, body) {
+  if (!browserDaemon) throw new Error("browser daemon is not running");
+  const r = await fetch(`http://127.0.0.1:${browserDaemon.port}${p}`, {
+    method,
+    headers: { "Content-Type": "application/json", "X-Browser-Token": browserDaemon.token },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || `browser daemon ${r.status}`);
+  return d;
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-User, X-Api-Key");
@@ -306,7 +490,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && pathname === "/api/health") {
-      return send(res, { running: runningCount(), queued: state.jobs.filter((j) => j.status === "queued").length, agents: mine(state.agents).length, channels: channels.length, caps: { MAX_RUNNING, PER_USER_RUNNING, QUEUE_MAX, JOB_TIMEOUT_MS } });
+      return send(res, { running: runningCount(), queued: state.jobs.filter((j) => j.status === "queued").length, agents: mine(state.agents).length, channels: channels.length, caps: { MAX_RUNNING, PER_USER_RUNNING, QUEUE_MAX, JOB_TIMEOUT_MS }, pool: pool ? pool.stats() : null, poolBroken, browser: !!browserDaemon });
     }
     if (req.method === "GET" && pathname === "/api/stats") return send(res, computeStats({ agents: mine(state.agents), jobs: mine(state.jobs) }));
     // ---- channels ----
@@ -396,7 +580,7 @@ const server = http.createServer(async (req, res) => {
       const callDir = path.resolve(import.meta.dirname, "data", "plugin-calls", randomUUID());
       fs.mkdirSync(callDir, { recursive: true });
       const child = fork(path.resolve(import.meta.dirname, "plugin-runner.mjs"), [], {
-        env: { PATH: process.env.PATH || "", PLUGIN_DIR: plugin.dir, TOOL_NAME: toolName, ARGS_JSON: JSON.stringify(b.args || {}), WORKSPACE: callDir, AGENT: user, MOLATUBE_DATA_DIR: path.resolve(import.meta.dirname, "data"), MAGPIE_LAYERFS_HOME: process.env.MAGPIE_LAYERFS_HOME || path.resolve(import.meta.dirname, "data", "layerfs-home"), MAGPIE_LAYERFS_PAGE_DIR: process.env.MAGPIE_LAYERFS_PAGE_DIR || path.resolve(import.meta.dirname, "data", "layerfs-page") },
+        env: { PATH: process.env.PATH || "", PLUGIN_DIR: plugin.dir, TOOL_NAME: toolName, ARGS_JSON: JSON.stringify(b.args || {}), WORKSPACE: callDir, AGENT: user, MOLATUBE_USER: user, MOLATUBE_DATA_DIR: path.resolve(import.meta.dirname, "data"), MOLATUBE_BROWSER_URL: browserDaemon ? `http://127.0.0.1:${browserDaemon.port}` : "", MOLATUBE_BROWSER_TOKEN: browserDaemon ? browserDaemon.token : "", MAGPIE_LAYERFS_HOME: process.env.MAGPIE_LAYERFS_HOME || path.resolve(import.meta.dirname, "data", "layerfs-home"), MAGPIE_LAYERFS_PAGE_DIR: process.env.MAGPIE_LAYERFS_PAGE_DIR || path.resolve(import.meta.dirname, "data", "layerfs-page") },
         stdio: ["ignore", "ignore", "ignore", "ipc"],
       });
       let answered = false;
@@ -424,6 +608,84 @@ const server = http.createServer(async (req, res) => {
         }, 200);
       });
       return;
+    }
+    // ---- real browser ----
+    if (req.method === "GET" && pathname === "/api/browser/health") {
+      try {
+        const h = await daemonCall("GET", "/health");
+        return send(res, { up: true, ...h });
+      } catch (e) { return send(res, { up: false, error: String(e.message) }); }
+    }
+    if (req.method === "POST" && pathname === "/api/browser/ensure") {
+      try {
+        await ensureBrowserDaemon();
+        return send(res, { up: true });
+      } catch (e) { return send(res, { up: false, error: String(e.message) }, 503); }
+    }
+    if (req.method === "GET" && pathname === "/api/browser/tabs") {
+      try {
+        const agent = url.searchParams.get("agent") || "";
+        const tabs = await daemonCall("GET", `/tabs?user=${encodeURIComponent(user)}${agent ? `&agent=${encodeURIComponent(agent)}` : ""}`);
+        return send(res, tabs);
+      } catch (e) { return send(res, { error: String(e.message) }, 503); }
+    }
+    if (req.method === "POST" && pathname === "/api/browser/open") {
+      const b = await body(req);
+      try {
+        const tab = await daemonCall("POST", "/tabs", { user, agent: String(b.agentId || "console").slice(0, 64), url: String(b.url || "") });
+        return send(res, tab);
+      } catch (e) { return send(res, { error: String(e.message) }, 400); }
+    }
+    if (req.method === "POST" && pathname === "/api/browser/context-close") {
+      const b = await body(req);
+      try {
+        const r = await daemonCall("POST", `/contexts/${encodeURIComponent(user)}/close`, { agent: String(b.agentId || "").slice(0, 64) });
+        return send(res, r);
+      } catch (e) { return send(res, { error: String(e.message) }, 400); }
+    }
+    const browserTabMatch = pathname.match(/^\/api\/browser\/([^/]+)\/(close|read|navigate|screenshot)$/);
+    if (browserTabMatch) {
+      const [, rawTabId, action] = browserTabMatch;
+      const tabId = decodeURIComponent(rawTabId);
+      const b = (req.method === "POST") ? await body(req) : {};
+      const agentId = String(b.agentId || req.headers["x-agent"] || "").slice(0, 64);
+      try {
+        if (action === "close") {
+          const r = await daemonCall("DELETE", `/tabs/${encodeURIComponent(tabId)}`, { user, agent: agentId });
+          return send(res, r);
+        }
+        if (action === "read") {
+          const r = await daemonCall("GET", `/tabs/${encodeURIComponent(tabId)}/read?user=${encodeURIComponent(user)}${agentId ? `&agent=${encodeURIComponent(agentId)}` : ""}`);
+          return send(res, r);
+        }
+        if (action === "navigate") {
+          const r = await daemonCall("POST", `/tabs/${encodeURIComponent(tabId)}/navigate`, { user, agent: agentId, url: String(b.url || "") });
+          return send(res, r);
+        }
+        if (action === "screenshot") {
+          const r = await daemonCall("POST", `/tabs/${encodeURIComponent(tabId)}/screenshot`, { user, agent: agentId });
+          return send(res, r);
+        }
+      } catch (e) { return send(res, { error: String(e.message) }, 400); }
+      return send(res, { error: "not found" }, 404);
+    }
+    // Workspace files (screenshots, artifacts): only the owning user,
+    // jailed inside that job's workspace dir.
+    const fileMatch = pathname.match(/^\/api\/jobs\/([^/]+)\/file$/);
+    if (req.method === "GET" && fileMatch) {
+      const job = findJob(fileMatch[1]);
+      if (!job || job.user !== user) return send(res, { error: "job not found" }, 404);
+      const rel = String(url.searchParams.get("path") || "");
+      const dir = workspaceOf(job.id);
+      const full = path.resolve(dir, rel);
+      if (full !== dir && !full.startsWith(dir + path.sep)) return send(res, { error: "path escape rejected" }, 400);
+      try {
+        const buf = fs.readFileSync(full);
+        const ext = path.extname(full).toLowerCase();
+        const type = ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : ext === ".gif" ? "image/gif" : "text/plain; charset=utf-8";
+        res.writeHead(200, { "Content-Type": type });
+        return res.end(buf);
+      } catch { return send(res, { error: "file not found" }, 404); }
     }
     // ---- agents ----
     if (req.method === "GET" && pathname === "/api/agents") return send(res, mine(state.agents).reverse());
@@ -475,6 +737,9 @@ const server = http.createServer(async (req, res) => {
       if (action === "stop") {
         for (const job of state.jobs.filter((j) => j.agentId === id && (j.status === "queued" || j.status === "running"))) cancelJob(job, "stopped by user");
         setAgent(agent, { status: "stopped", pauseAfterCurrent: false, currentJobId: null }, { kind: "agent_stopped", agent: id });
+        // Stopping an agent closes its browser context (all its tabs).
+        // Best-effort: a down daemon must not fail the stop.
+        daemonCall("POST", `/contexts/${encodeURIComponent(user)}/close`, { agent: id }).catch(() => {});
         return send(res, agent);
       }
       if (action === "retry") {
@@ -509,7 +774,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && /^\/api\/agents\/[^/]+$/.test(pathname)) {
       const agent = findAgent(pathname.split("/")[3]);
       if (!agent || agent.user !== user) return send(res, { error: "agent not found" }, 404);
-      return send(res, { ...agent, jobs: state.jobs.filter((j) => j.agentId === agent.id).reverse() });
+      let browserTabs = [];
+      try { browserTabs = await daemonCall("GET", `/tabs?user=${encodeURIComponent(user)}&agent=${encodeURIComponent(agent.id)}`); } catch { /* daemon down: tabs unknown, not fatal */ }
+      return send(res, { ...agent, jobs: state.jobs.filter((j) => j.agentId === agent.id).reverse(), browser: { tabs: browserTabs } });
     }
     // ---- jobs (v0.1 compatible) ----
     if (req.method === "GET" && pathname === "/api/jobs") return send(res, mine(state.jobs).reverse());
@@ -566,10 +833,26 @@ async function shutdown(signal) {
   const deadline = Date.now() + 10000;
   while (runningCount() > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
   for (const [jobId] of children) killChild(jobId);
+  if (pool) pool.shutdown();
+  if (browserDaemon) {
+    const d = browserDaemon;
+    try { d.child.kill("SIGTERM"); } catch { /* gone */ }
+    setTimeout(() => { try { d.child.kill("SIGKILL"); } catch { /* gone */ } }, 3000);
+  }
   saveState(state);
   process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-server.listen(PORT, () => console.log(`MolaTube v1.1 on http://localhost:${PORT} (max_running=${MAX_RUNNING}, per_user=${PER_USER_RUNNING}, queue_max=${QUEUE_MAX}, require_key=${REQUIRE_KEY})`));
+// Boot order matters: the browser daemon first (pool workers inherit its
+// address/token), then the pool. A down browser never blocks the server.
+if (BROWSER_ENABLED) {
+  try {
+    await ensureBrowserDaemon();
+    console.log("MolaTube browser daemon up");
+  } catch (e) { console.log(`MolaTube browser daemon unavailable: ${e.message}`); }
+}
+if (POOL_ENABLED) setupPool();
+
+server.listen(PORT, () => console.log(`MolaTube v1.2 on http://localhost:${PORT} (max_running=${MAX_RUNNING}, per_user=${PER_USER_RUNNING}, queue_max=${QUEUE_MAX}, require_key=${REQUIRE_KEY}, pool=${POOL_ENABLED}, browser=${!!browserDaemon})`));

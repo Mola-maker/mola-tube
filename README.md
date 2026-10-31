@@ -1,6 +1,6 @@
 <img src="assets/icon.webp" alt="MolaTube 图标" width="120">
 
-# MolaTube · 自选式学习视频站 v1.1
+# MolaTube · 自选式学习视频站 v1.2
 
 **30 秒了解：MolaTube 是什么？** 一个用户自己选、自己看的 YouTube 式学习视频站，
 配一个网页可控的高并发 Agent Harness。**适合谁？** 想按自己的节奏学视频、
@@ -15,6 +15,27 @@ npm start
 **范围规则（不变）：** 用户自己选、自己看；Agent 只做用户主动发起的辅助
 （总结、答疑、笔记、自测），不自动刷课、不代答考试、不碰任何第三方学习平台
 的账号与考试。
+
+## v1.2：真实浏览器 + 极致优化（2026-11-01）
+
+- **真实浏览器**（`server/browser-daemon.mjs`，详见 `docs/BROWSER.md`）：每 Agent
+  独立 BrowserContext 的真实 Chromium 标签页（开 / 关 / 导航 / 读取 / 截图），
+  前端新增“浏览器”页。传输按深度调研的最终选型走
+  `--remote-debugging-pipe`（fd3/fd4，零 npm 依赖），不用 WebSocket；
+  浏览器池化 + 定期回收 + 内存看门狗；截图默认视口 JPEG q75。
+  只允许公开 http(s) 网址，localhost 与内网地址一律拒绝；不登录任何账号、
+  不碰学习平台。
+- **极致优化**：Worker 池（`server/pool.mjs` + `server/pool-worker.mjs`）——
+  常驻进程复用，插件只在启动时导入一次，任务不再付 fork 与导入成本。
+  压测 v2（见 `docs/stress-report-v2.json`）：50 任务 50/50 完成、0 失败、
+  上限 5 守住、4.76 秒（10.5 任务/秒，v1.1 为 7.04 秒 / 7.1 任务/秒），
+  压测中控制面 p95 85ms（v1.1 为 270ms）。浏览器并发实测：3 Agent 并行
+  开 / 读 / 截图 / 关全过，且互相看不到、关不掉对方的标签页。
+- **选型结论**（深度调研，报告见 `docs/BROWSER.md` 引用）：原生 CDP + pipe +
+  chrome-headless-shell + 每 Agent BrowserContext + 浏览器池化是最终选型；
+  唯一备选是 `playwright-core` + `--only-shell`（仅当需要 Firefox/WebKit、
+  无力维护 CDP、或需要自动等待/定位器时）；Selenium 与 browser-use 等
+  Agent 框架已排除。
 
 ## v1.1：真实插件、真实控制、真实并发（2026-11-01）
 
@@ -111,5 +132,6 @@ npm start
 ## 路线图
 
 - v1.0：完整产品——前端四页 + 渠道/令牌/配额/统计 + Magpie 双向接入。
-- v1.1（本版）：真实插件 + 真实执行 + 真实控制 + 并发硬化 + 前端优化 + 50 并发压测通过。
-- v1.2：接 molamaker_site_v2 的 CSS/动画/插图风格，替换现有主题；接真实视频源与真实 LLM 执行步骤。
+- v1.1：真实插件 + 真实执行 + 真实控制 + 并发硬化 + 前端优化 + 50 并发压测通过。
+- v1.2（本版）：Worker 池 + 真实浏览器（pipe 传输 + 池化 + 看门狗 + JPEG 截图）+ 压测 v2 通过。
+- 后续：接 molamaker_site_v2 的 CSS/动画/插图风格，替换现有主题；接真实视频源与真实 LLM 执行步骤。

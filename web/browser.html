@@ -1,0 +1,15 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>浏览器 · MolaTube</title><link rel="stylesheet" href="styles.css"></head>
+<body><header><div class="logo"><img src="icon.webp" alt="" style="height:22px;vertical-align:middle;border-radius:6px"> Mola<b>Tube</b></div><nav class="nav"><a href="index.html">首页</a><a href="workbench.html">Agent 工作台</a><a href="agents.html">Agents 控制</a><a class="on" href="browser.html">浏览器</a><a href="dashboard.html">控制面板</a></nav></header>
+<main>
+<h1>真实浏览器</h1>
+<p class="note" id="mode">正在连接…</p>
+<p class="note">这里开的是真实 Chromium 标签页（每个 agent 独立上下文，互不串数据）。只允许公开 http(s) 网址；localhost 与内网地址会被拒绝。也不会替你登录任何账号、不碰学习平台。</p>
+<div class="panel">
+<input id="tabUrl" placeholder="输入公开网址，例如 https://example.com" style="width:60%">
+<button class="btn" onclick="openTab()">开新标签页</button>
+<button class="btn ghost" onclick="refresh()">刷新</button>
+</div>
+<div id="tabs" class="grid"></div>
+<div class="panel"><h3>读取结果</h3><pre id="readOut" style="white-space:pre-wrap">点某个标签页的「读取」后显示标题与正文片段；「截图」会把图片存在该任务的工作区。</pre><div id="shotWrap"></div></div>
+</main>
+<script src="browser.js"></script></body></html>

@@ -1,5 +1,5 @@
 const API="http://localhost:3000";
-let agents=[],jobs=[],audit=[],demo=true,lastKey="";
+let agents=[],jobs=[],audit=[],demo=true,lastKey="",tabCounts={};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");}
 function jobOf(a){return jobs.find(j=>j.id===a.currentJobId)||jobs.filter(j=>j.agentId===a.id)[0];}
 function card(a){
@@ -10,7 +10,8 @@ function card(a){
   if(a.status==="paused") btns.push(`<button class="btn" onclick="act('${a.id}','resume')">恢复</button>`);
   if(a.status!=="stopped") btns.push(`<button class="ghost" onclick="act('${a.id}','stop')">停止</button>`);
   if(a.status==="waiting") btns.push(`<button class="btn" onclick="act('${a.id}','retry')">重试</button>`);
-  return `<div class="job"><b>${esc(a.name)}</b> · ${a.type} · ${a.videoId} · <b>${a.status}</b>${j?`<div class="bar"><i style="width:${j.progress||0}%"></i></div><small>${j.progress||0}% · ${esc(j.step||"")} · ${esc(j.result||"")}</small>`:""}<br><input id="note-${a.id}" placeholder="给这个 agent 留备注…"> <button class="ghost" onclick="note('${a.id}')">备注</button> ${btns.join(" ")}</div>`;
+  const tabs=tabCounts[a.id]||0;
+  return `<div class="job"><b>${esc(a.name)}</b> · ${a.type} · ${a.videoId} · <b>${a.status}</b> · 🌐 标签页 ${tabs}${j?`<div class="bar"><i style="width:${j.progress||0}%"></i></div><small>${j.progress||0}% · ${esc(j.step||"")} · ${esc(j.result||"")}</small>`:""}<br><input id="note-${a.id}" placeholder="给这个 agent 留备注…"> <button class="ghost" onclick="note('${a.id}')">备注</button> ${btns.join(" ")}</div>`;
 }
 async function refresh(){
   try{
@@ -22,13 +23,21 @@ async function refresh(){
     if(!ra.ok) throw 0;
     agents=await ra.json(); jobs=await rj.json(); audit=await rau.json(); demo=false;
     const h=await rh.json();
-    document.getElementById("healthBody").textContent=`运行中 ${h.running} / 上限 ${h.caps.MAX_RUNNING} · 排队 ${h.queued} / 上限 ${h.caps.QUEUE_MAX} · 每用户上限 ${h.caps.PER_USER_RUNNING} · Agents ${h.agents}`;
+    document.getElementById("healthBody").textContent=`运行中 ${h.running} / 上限 ${h.caps.MAX_RUNNING} · 排队 ${h.queued} / 上限 ${h.caps.QUEUE_MAX} · 每用户上限 ${h.caps.PER_USER_RUNNING} · Agents ${h.agents} · 池 ${h.pool?`${h.pool.busy}/${h.pool.size}`:"关"} · 浏览器 ${h.browser?"已连接":"未连接"}`;
+    try{
+      const rt=await fetch(API+"/api/browser/tabs",{signal:AbortSignal.timeout(1500)});
+      if(rt.ok){
+        const tabs=await rt.json();
+        tabCounts={};
+        for(const t of tabs) tabCounts[t.agent]=(tabCounts[t.agent]||0)+1;
+      }
+    }catch(e){ /* browser tabs optional */ }
   }catch(e){
     demo=true;
     document.getElementById("healthBody").textContent="后端未连接：启动 node server/index.mjs 后自动切换。";
   }
   // 状态没变就不重写 DOM，避免轮询/SSE 双通道下的闪烁与重排。
-  const key=JSON.stringify({demo,agents,jobs,audit});
+  const key=JSON.stringify({demo,agents,jobs,audit,tabCounts});
   if(key===lastKey) return;
   lastKey=key;
   document.getElementById("mode").textContent=demo?"本地演示模式：后端未连接，创建的 agent 只存在浏览器里，不产生外部请求。":"已连接本地 Harness：状态持久化、子进程隔离、SSE 实时推送。";
