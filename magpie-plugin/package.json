@@ -1,0 +1,1 @@
+{"description":"Control MolaTube agents from Magpie: create/start/pause/stop/retry agents and run jobs, through the MolaTube control-plane API.","license":"MIT","main":"index.mjs","name":"molatube-magpie-plugin","type":"module","version":"1.0.0"}
