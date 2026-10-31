@@ -14,6 +14,7 @@ import { loadChannels, saveChannels, routeChannel, newChannel, CHANNEL_TYPES } f
 import { loadKeys, saveKeys, createKey, verifyKey, maskKey } from "./keys.mjs";
 import { loadQuotas, saveQuotas, getQuota, jobsToday } from "./quotas.mjs";
 import { computeStats } from "./stats.mjs";
+import { loadPlugins, allPluginDirs, findPlugin } from "./plugins.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_RUNNING = Number(process.env.MAX_RUNNING || 3);
@@ -29,6 +30,11 @@ const state = loadState();
 let channels = loadChannels();
 let keys = loadKeys();
 let quotas = loadQuotas();
+let pluginRegistry = null;
+async function ensurePlugins() {
+  if (!pluginRegistry) pluginRegistry = await loadPlugins(allPluginDirs());
+  return pluginRegistry;
+}
 const children = new Map();
 const timers = new Map();
 const sseClients = new Set();
@@ -94,7 +100,9 @@ function resolveUser(req) {
   return { user: String(req.headers["x-user"] || "demo-user").slice(0, 64) };
 }
 
+let draining = false;
 function pump() {
+  if (draining) return;
   if (runningCount() >= MAX_RUNNING) return;
   for (const job of state.jobs.filter((j) => j.status === "queued")) {
     if (runningCount() >= MAX_RUNNING) break;
@@ -106,6 +114,7 @@ function pump() {
     }
     const channel = job.channelId ? channels.find((c) => c.id === job.channelId) : routeChannel(channels);
     if (!channel || !channel.enabled) continue; // all channels off: stay queued, honestly.
+    if (channel.concurrency > 0 && state.jobs.filter((j) => j.status === "running" && j.channel === channel.id).length >= channel.concurrency) continue;
     startJob(job, channel);
   }
 }
@@ -124,10 +133,18 @@ function spawnExecutor(job, channel) {
     MOLATUBE_VIDEO_ID: job.videoId,
     MOLATUBE_WORKSPACE: dir,
     MOLATUBE_WORKER_MEM_MB: String(WORKER_MEM_MB),
+    MOLATUBE_QUESTION: job.question || "",
+    MOLATUBE_PLUGIN: job.plugin || "",
+    MOLATUBE_TOOL: job.tool || "",
+    MOLATUBE_ARGS_JSON: JSON.stringify(job.args || {}),
+    MOLATUBE_PLUGIN_DIRS: allPluginDirs().join(":"),
+    MOLATUBE_DATA_DIR: path.resolve(import.meta.dirname, "data"),
+    MAGPIE_LAYERFS_HOME: process.env.MAGPIE_LAYERFS_HOME || path.resolve(import.meta.dirname, "data", "layerfs-home"),
+    MAGPIE_LAYERFS_PAGE_DIR: process.env.MAGPIE_LAYERFS_PAGE_DIR || path.resolve(import.meta.dirname, "data", "layerfs-page"),
   };
   if (channel.type === "magpie") {
     return fork(path.resolve(import.meta.dirname, "magpie-runner.mjs"), [], {
-      env: { ...baseEnv, MOLATUBE_TOOL_CALL: JSON.stringify({ tool: "molatube.run_job", arguments: { type: job.type, videoId: job.videoId } }) },
+      env: { ...baseEnv, MOLATUBE_TOOL_CALL: JSON.stringify({ tool: "molatube.run_job", arguments: { type: job.type, videoId: job.videoId, question: job.question, plugin: job.plugin, tool: job.tool, args: job.args } }) },
       execArgv: [`--max-old-space-size=${WORKER_MEM_MB}`],
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
@@ -167,11 +184,18 @@ function startJob(job, channel) {
   child.on("exit", (code) => {
     children.delete(job.id);
     clearTimer(job.id);
-    if (job.status === "running") {
-      setJob(job, { status: "failed", result: `Worker 异常退出（code ${code}），请重试。` }, { kind: "job_failed", job: job.id, agent: job.agentId || null, code });
-      finishAgent(job);
-    }
-    pump();
+    // Grace period: the child's exit event can arrive before its last IPC
+    // message is delivered. A worker that finished its artifacts and sent
+    // "done" must not be marked failed just because exit won the race.
+    // Wait 200ms; if the job is still running then, it really produced
+    // no result.
+    setTimeout(() => {
+      if (job.status === "running") {
+        setJob(job, { status: "failed", result: `Worker 异常退出（code ${code}），请重试。` }, { kind: "job_failed", job: job.id, agent: job.agentId || null, code });
+        finishAgent(job);
+      }
+      pump();
+    }, 200);
   });
   const timer = setTimeout(() => {
     if (job.status === "running") {
@@ -229,8 +253,8 @@ function quotaCheck(user, kind) {
   }
   return null;
 }
-function newJob({ agentId, user, videoId, type, channelId }) {
-  const job = { id: randomUUID(), agentId: agentId || null, user, videoId, type, status: "queued", progress: 0, step: "", result: "", workspace: "", channel: null, channelId: channelId || null, createdAt: Date.now() };
+function newJob({ agentId, user, videoId, type, channelId, question, plugin, tool, args }) {
+  const job = { id: randomUUID(), agentId: agentId || null, user, videoId, type, status: "queued", progress: 0, step: "", result: "", workspace: "", channel: null, channelId: channelId || null, question: question || "", plugin: plugin || "", tool: tool || "", args: args || {}, createdAt: Date.now() };
   job.workspace = `server/workspaces/${job.id}`;
   return job;
 }
@@ -243,7 +267,7 @@ function body(req) {
   });
 }
 const send = (res, obj, code = 200) => { res.setHeader("Content-Type", "application/json"); res.statusCode = code; res.end(JSON.stringify(obj)); };
-const TYPES = ["summary", "qa", "notes", "quiz"];
+const TYPES = ["summary", "qa", "notes", "quiz", "plugin"];
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".webp": "image/webp", ".svg": "image/svg+xml", ".png": "image/png" };
 
 function serveStatic(req, res, pathname) {
@@ -306,6 +330,7 @@ const server = http.createServer(async (req, res) => {
         if (typeof b.enabled === "boolean") ch.enabled = b.enabled;
         if (Number.isFinite(Number(b.priority))) ch.priority = Number(b.priority);
         if (Number.isFinite(Number(b.weight))) ch.weight = Number(b.weight);
+        if (Number.isFinite(Number(b.concurrency))) ch.concurrency = Math.max(0, Number(b.concurrency));
         if (typeof b.endpoint === "string") ch.endpoint = b.endpoint.slice(0, 512) || null;
         if (typeof b.name === "string" && b.name) ch.name = b.name.slice(0, 64);
         saveChannels(channels);
@@ -354,6 +379,52 @@ const server = http.createServer(async (req, res) => {
       saveQuotas(quotas);
       return send(res, cur);
     }
+    // ---- plugins ----
+    if (req.method === "GET" && pathname === "/api/plugins") {
+      pluginRegistry = await loadPlugins(allPluginDirs());
+      return send(res, pluginRegistry.map((p) => ({ name: p.name, error: p.error || null, tools: Object.entries(p.tools).map(([name, t]) => ({ name, description: t.description || "" })) })));
+    }
+    const pluginCallMatch = pathname.match(/^\/api\/plugins\/([^/]+)\/([^/]+)\/call$/);
+    if (req.method === "POST" && pluginCallMatch) {
+      const [, pluginName, toolName] = pluginCallMatch;
+      const plugins = await ensurePlugins();
+      const plugin = findPlugin(plugins, pluginName);
+      if (!plugin || plugin.error) return send(res, { error: plugin?.error || "plugin not found" }, 404);
+      const tool = plugin.tools[toolName];
+      if (!tool) return send(res, { error: "tool not found" }, 404);
+      const b = await body(req);
+      const callDir = path.resolve(import.meta.dirname, "data", "plugin-calls", randomUUID());
+      fs.mkdirSync(callDir, { recursive: true });
+      const child = fork(path.resolve(import.meta.dirname, "plugin-runner.mjs"), [], {
+        env: { PATH: process.env.PATH || "", PLUGIN_DIR: plugin.dir, TOOL_NAME: toolName, ARGS_JSON: JSON.stringify(b.args || {}), WORKSPACE: callDir, AGENT: user, MOLATUBE_DATA_DIR: path.resolve(import.meta.dirname, "data"), MAGPIE_LAYERFS_HOME: process.env.MAGPIE_LAYERFS_HOME || path.resolve(import.meta.dirname, "data", "layerfs-home"), MAGPIE_LAYERFS_PAGE_DIR: process.env.MAGPIE_LAYERFS_PAGE_DIR || path.resolve(import.meta.dirname, "data", "layerfs-page") },
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+      });
+      let answered = false;
+      const timer = setTimeout(() => {
+        if (answered) return;
+        answered = true;
+        try { child.kill("SIGKILL"); } catch { /* gone */ }
+        send(res, { error: "plugin call timed out (30s)" }, 504);
+      }, 30000);
+      child.on("message", (msg) => {
+        if (answered) return;
+        answered = true;
+        clearTimeout(timer);
+        if (msg.kind === "done") send(res, { result: msg.result, workspace: callDir });
+        else send(res, { error: msg.error || "plugin call failed" }, 400);
+      });
+      child.on("exit", (code) => {
+        if (answered) return;
+        // Same exit-before-message race: wait 200ms for a result message.
+        setTimeout(() => {
+          if (answered) return;
+          answered = true;
+          clearTimeout(timer);
+          send(res, { error: `plugin runner exited (code ${code})` }, 400);
+        }, 200);
+      });
+      return;
+    }
     // ---- agents ----
     if (req.method === "GET" && pathname === "/api/agents") return send(res, mine(state.agents).reverse());
     if (req.method === "POST" && pathname === "/api/agents") {
@@ -361,7 +432,14 @@ const server = http.createServer(async (req, res) => {
       if (err) return send(res, { error: err }, 429);
       const b = await body(req);
       const type = TYPES.includes(b.type) ? b.type : "summary";
-      const agent = { id: randomUUID(), user, name: String(b.name || `Agent-${state.agents.length + 1}`).slice(0, 64), type, videoId: String(b.videoId || "v1").slice(0, 64), status: "idle", currentJobId: null, pauseAfterCurrent: false, notes: [], createdAt: Date.now() };
+      let plugin = "", tool = "", args = {};
+      if (type === "plugin") {
+        const plugins = await ensurePlugins();
+        const p = findPlugin(plugins, b.plugin || "");
+        if (!p || p.error || !p.tools[b.tool || ""]) return send(res, { error: "plugin or tool not found" }, 400);
+        plugin = b.plugin; tool = b.tool; args = (b.args && typeof b.args === "object") ? b.args : {};
+      }
+      const agent = { id: randomUUID(), user, name: String(b.name || `Agent-${state.agents.length + 1}`).slice(0, 64), type, videoId: String(b.videoId || "v1").slice(0, 64), plugin, tool, args, status: "idle", currentJobId: null, pauseAfterCurrent: false, notes: [], createdAt: Date.now() };
       state.agents.push(agent);
       setAgent(agent, {}, { kind: "agent_created", agent: agent.id, type, video: agent.videoId, user });
       return send(res, agent);
@@ -377,7 +455,8 @@ const server = http.createServer(async (req, res) => {
         const err = quotaCheck(user, "job");
         if (err) return send(res, { error: err }, 429);
         if (state.jobs.filter((j) => j.status === "queued").length >= QUEUE_MAX) return send(res, { error: "队列已满，请稍后再试" }, 429);
-        const job = newJob({ agentId: id, user, videoId: agent.videoId, type: agent.type });
+        const question = agent.type === "qa" && agent.notes.length ? agent.notes[agent.notes.length - 1].text : "";
+        const job = newJob({ agentId: id, user, videoId: agent.videoId, type: agent.type, question, plugin: agent.plugin, tool: agent.tool, args: agent.args });
         state.jobs.push(job);
         setJob(job, {}, { kind: "job_queued", job: job.id, agent: id, type: job.type, video: job.videoId, user });
         pump();
@@ -404,7 +483,7 @@ const server = http.createServer(async (req, res) => {
         const err = quotaCheck(user, "job");
         if (err) return send(res, { error: err }, 429);
         setAgent(agent, { status: "idle", pauseAfterCurrent: false }, null);
-        const job = newJob({ agentId: id, user, videoId: last.videoId, type: last.type });
+        const job = newJob({ agentId: id, user, videoId: last.videoId, type: last.type, question: last.question, plugin: last.plugin, tool: last.tool, args: last.args });
         state.jobs.push(job);
         setJob(job, {}, { kind: "job_queued", job: job.id, agent: id, type: job.type, video: job.videoId, user, retryOf: last.id });
         pump();
@@ -450,7 +529,14 @@ const server = http.createServer(async (req, res) => {
         if (!ch.enabled) return send(res, { error: "所选通道已停用" }, 400);
         channelId = ch.id;
       }
-      const job = newJob({ user, videoId, type, channelId });
+      let plugin = "", tool = "", args = {};
+      if (type === "plugin") {
+        const plugins = await ensurePlugins();
+        const p = findPlugin(plugins, b.plugin || "");
+        if (!p || p.error || !p.tools[b.tool || ""]) return send(res, { error: "plugin or tool not found" }, 400);
+        plugin = b.plugin; tool = b.tool; args = (b.args && typeof b.args === "object") ? b.args : {};
+      }
+      const job = newJob({ user, videoId, type, channelId, question: String(b.question || "").slice(0, 2000), plugin, tool, args });
       state.jobs.push(job);
       setJob(job, {}, { kind: "job_queued", job: job.id, type, video: videoId, user });
       pump();
@@ -469,4 +555,21 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`MolaTube v1.0 on http://localhost:${PORT} (max_running=${MAX_RUNNING}, per_user=${PER_USER_RUNNING}, queue_max=${QUEUE_MAX}, require_key=${REQUIRE_KEY})`));
+// Graceful shutdown: stop starting new jobs, wait up to 10s for running
+// jobs to finish, then kill the rest, save state and exit. A killed job
+// is marked interrupted on the next boot, never silently dropped.
+async function shutdown(signal) {
+  if (draining) return;
+  draining = true;
+  console.log(`MolaTube shutting down (${signal}), draining...`);
+  server.close();
+  const deadline = Date.now() + 10000;
+  while (runningCount() > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
+  for (const [jobId] of children) killChild(jobId);
+  saveState(state);
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+server.listen(PORT, () => console.log(`MolaTube v1.1 on http://localhost:${PORT} (max_running=${MAX_RUNNING}, per_user=${PER_USER_RUNNING}, queue_max=${QUEUE_MAX}, require_key=${REQUIRE_KEY})`));

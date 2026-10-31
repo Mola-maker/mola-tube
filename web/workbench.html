@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent 工作台 · MolaTube</title><link rel="stylesheet" href="styles.css"><link rel="icon" href="icon.webp"></head>
-<body><header><div class="logo">Mola<b>Tube</b></div><nav class="nav"><a href="index.html">首页</a><a class="on" href="workbench.html">Agent 工作台</a><a href="agents.html">Agents 控制</a><a href="dashboard.html">控制面板</a></nav></header>
+<body><header><div class="logo"><img src="icon.webp" alt="" style="height:22px;vertical-align:middle;border-radius:6px"> Mola<b>Tube</b></div><nav class="nav"><a href="index.html">首页</a><a class="on" href="workbench.html">Agent 工作台</a><a href="agents.html">Agents 控制</a><a href="dashboard.html">控制面板</a></nav></header>
 <main class="main"><h2>Agent 工作台</h2><p class="note" id="mode"></p>
-<div class="panel"><h3>新建任务（你主动发起）</h3><select id="jobVideo"></select> <select id="jobType"><option value="summary">视频总结</option><option value="qa">针对视频答疑</option><option value="notes">整理笔记</option><option value="quiz">生成自测题（自学用）</option></select> <button class="btn" onclick="createJob()">提交</button><p class="note">每个任务一个独立工作区，互不可见；可随时取消。工作台绝不替你刷课、代考。</p></div>
+<div class="panel"><h3>新建任务（你主动发起）</h3><select id="jobVideo"></select> <select id="jobType"><option value="summary">视频总结</option><option value="qa">针对视频答疑</option><option value="notes">整理笔记</option><option value="quiz">生成自测题（自学用）</option></select> <input id="jobQuestion" placeholder="答疑问题（仅答疑任务用）"> <button class="btn" onclick="createJob()">提交</button><p class="note">每个任务一个独立工作区，互不可见；可随时取消。工作台绝不替你刷课、代考。</p></div>
 <div id="jobs"></div>
 <div class="panel"><h3>审计记录</h3><div id="audit" class="note"></div></div></main>
 <script src="app.js"></script><script src="workbench.js"></script></body></html>

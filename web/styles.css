@@ -17,3 +17,5 @@ input,select{padding:9px 12px;border:1px solid var(--line);background:var(--pane
 .bar{height:8px;background:var(--panel2);border-radius:4px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent)}
 .note{font-size:13px;color:var(--muted);line-height:1.7}
 @media(max-width:900px){.side{display:none}.watch{grid-template-columns:1fr}}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.card{content-visibility:auto;contain-intrinsic-size:280px 220px}

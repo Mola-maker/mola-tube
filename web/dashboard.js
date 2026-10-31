@@ -1,4 +1,12 @@
 const API="";
+let lastKey="";
+function toast(msg){
+  const d=document.createElement("div");
+  d.textContent=msg;
+  d.style.cssText="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 18px;border-radius:20px;z-index:99;border:1px solid #444";
+  document.body.appendChild(d);
+  setTimeout(()=>d.remove(),3000);
+}
 function key(){return localStorage.getItem("molatube_key")||"";}
 function headers(){return {"Content-Type":"application/json",...(key()?{"X-Api-Key":key()}:{})};}
 async function api(method,p,body){
@@ -19,6 +27,9 @@ let auditCache=[];
 async function refresh(){
   try{
     const [stats,health,channels,keysList,audit,quotas]=await Promise.all([api("GET","/api/stats"),api("GET","/api/health"),api("GET","/api/channels"),api("GET","/api/keys"),api("GET","/api/audit"),api("GET","/api/quotas")]);
+    const key2=JSON.stringify({stats,health,channels,keysList,audit,quotas});
+    if(key2===lastKey) return;
+    lastKey=key2;
     document.getElementById("statCards").innerHTML=`<div class="stat"><b>${stats.agents.total}</b>Agents</div><div class="stat"><b>${stats.jobs.total}</b>任务总数</div><div class="stat"><b>${stats.running}</b>运行中</div><div class="stat"><b>${stats.queued}</b>排队中</div><div class="stat"><b>${channels.length}</b>渠道</div><div class="stat"><b>${keysList.length}</b>令牌</div>`;
     const max=Math.max(1,...stats.last14Days.map(d=>d.count));
     document.getElementById("chart").innerHTML=stats.last14Days.map(d=>`<div style="height:${Math.round(d.count/max*110)+2}px" title="${d.date}: ${d.count}"></div>`).join("");
@@ -39,9 +50,9 @@ function renderLogs(){
 }
 async function addChannel(){
   try{ await api("POST","/api/channels",{name:document.getElementById("chName").value,type:document.getElementById("chType").value,priority:Number(document.getElementById("chPriority").value),weight:Number(document.getElementById("chWeight").value),endpoint:document.getElementById("chEndpoint").value}); refresh(); }
-  catch(e){ alert(e.message); }
+  catch(e){ toast(e.message); }
 }
-async function patchChannel(id,patch){ try{ await api("PATCH","/api/channels/"+id,patch); refresh(); }catch(e){ alert(e.message); } }
+async function patchChannel(id,patch){ try{ await api("PATCH","/api/channels/"+id,patch); refresh(); }catch(e){ toast(e.message); } }
 async function delChannel(id){ if(!confirm("删除该渠道？"))return; await api("DELETE","/api/channels/"+id); refresh(); }
 async function testChannel(id){ try{ const r=await api("POST","/api/channels/"+id+"/test"); document.getElementById("test-"+id).textContent=r.ok?"✓ 通过":"✗ 失败"; }catch(e){ document.getElementById("test-"+id).textContent="✗ "+e.message; } }
 async function addKey(){
@@ -49,8 +60,21 @@ async function addKey(){
     const r=await api("POST","/api/keys",{name:document.getElementById("keyName").value,quota:Number(document.getElementById("keyQuota").value)});
     document.getElementById("newKeyBanner").innerHTML=`<div class="panel">新令牌（只显示一次，请立即复制）：<b>${esc(r.plain)}</b> <button class="btn" onclick="navigator.clipboard.writeText('${r.plain}')">复制</button></div>`;
     refresh();
-  }catch(e){ alert(e.message); }
+  }catch(e){ toast(e.message); }
 }
 async function revokeKey(id){ await api("POST","/api/keys/"+id+"/revoke"); refresh(); }
-async function saveQuotas(){ try{ await api("PATCH","/api/quotas",{maxAgents:Number(document.getElementById("qAgents").value),maxJobsPerDay:Number(document.getElementById("qJobs").value)}); alert("已保存"); }catch(e){ alert(e.message); } }
-(function(){ const k=key(); if(k) document.getElementById("apiKeyInput").value=k; refresh(); setInterval(refresh,3000); })();
+async function saveQuotas(){ try{ await api("PATCH","/api/quotas",{maxAgents:Number(document.getElementById("qAgents").value),maxJobsPerDay:Number(document.getElementById("qJobs").value)}); toast("已保存"); }catch(e){ toast(e.message); } }
+(function(){
+  const k=key(); if(k) document.getElementById("apiKeyInput").value=k;
+  // SSE 为主通道；只有 SSE 未接通时才轮询。
+  let pollTimer=null;
+  const startPoll=()=>{ if(!pollTimer) pollTimer=setInterval(refresh,3000); };
+  const stopPoll=()=>{ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } };
+  try{
+    const es=new EventSource("/api/events");
+    es.onopen=()=>stopPoll();
+    es.onmessage=()=>refresh();
+    es.onerror=()=>startPoll();
+  }catch(e){ startPoll(); }
+  refresh(); startPoll();
+})();

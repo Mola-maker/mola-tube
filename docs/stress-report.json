@@ -1,0 +1,31 @@
+{
+  "posts": 50,
+  "distinctJobs": 50,
+  "totalMs": 7040,
+  "timeToAllTerminalMs": 7040,
+  "throughputPerSec": 7.1,
+  "caps": {
+    "MAX_RUNNING": 5,
+    "PER_USER_RUNNING": 5,
+    "QUEUE_MAX": 100,
+    "JOB_TIMEOUT_MS": 120000
+  },
+  "maxRunningObserved": 5,
+  "capRespected": true,
+  "terminalCount": 50,
+  "byStatus": {
+    "done": 50
+  },
+  "failureRate": 0,
+  "jobLatencyObservedMs": {
+    "p50": 3805,
+    "p95": 6373
+  },
+  "controlLatencyMs": {
+    "p50": 134,
+    "p95": 270,
+    "samples": 4
+  },
+  "healthTimeouts": 0,
+  "recovered": true
+}

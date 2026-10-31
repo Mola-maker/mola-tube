@@ -1,5 +1,5 @@
 const API="http://localhost:3000";
-let agents=[],jobs=[],audit=[],demo=true;
+let agents=[],jobs=[],audit=[],demo=true,lastKey="";
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");}
 function jobOf(a){return jobs.find(j=>j.id===a.currentJobId)||jobs.filter(j=>j.agentId===a.id)[0];}
 function card(a){
@@ -27,7 +27,11 @@ async function refresh(){
     demo=true;
     document.getElementById("healthBody").textContent="后端未连接：启动 node server/index.mjs 后自动切换。";
   }
-  document.getElementById("mode").textContent=demo?"本地演示模式：后端未连接，创建的 agent 只存在浏览器里，不产生外部请求。":"已连接本地 Harness v0.2：状态持久化、子进程隔离、SSE 实时推送。";
+  // 状态没变就不重写 DOM，避免轮询/SSE 双通道下的闪烁与重排。
+  const key=JSON.stringify({demo,agents,jobs,audit});
+  if(key===lastKey) return;
+  lastKey=key;
+  document.getElementById("mode").textContent=demo?"本地演示模式：后端未连接，创建的 agent 只存在浏览器里，不产生外部请求。":"已连接本地 Harness：状态持久化、子进程隔离、SSE 实时推送。";
   const waiting=agents.filter(a=>a.status==="waiting");
   document.getElementById("waiting").innerHTML=waiting.map(card).join("")||"<p class='note'>没有等你处理的 agent。</p>";
   document.getElementById("agents").innerHTML=agents.map(card).join("")||"<p class='note'>暂无 agent，先创建一个。</p>";
@@ -52,10 +56,15 @@ async function note(id){
 (function init(){
   const sel=document.getElementById("agentVideo");
   if(sel&&typeof VIDEOS!=="undefined") sel.innerHTML=VIDEOS.map(x=>`<option value="${x.id}">${x.title}</option>`).join("");
+  // SSE 为主通道；只有 SSE 未接通时才轮询，避免双通道重复刷新。
+  let pollTimer=null;
+  const startPoll=()=>{ if(!pollTimer) pollTimer=setInterval(refresh,2000); };
+  const stopPoll=()=>{ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } };
   try{
     const es=new EventSource(API+"/api/events");
+    es.onopen=()=>stopPoll();
     es.onmessage=()=>refresh();
-    es.onerror=()=>{};
-  }catch(e){/* polling fallback below */}
-  refresh(); setInterval(refresh,2000);
+    es.onerror=()=>startPoll();
+  }catch(e){ startPoll(); }
+  refresh(); startPoll();
 })();

@@ -17,8 +17,8 @@ export const CHANNEL_TYPES = ["local", "magpie"];
 export function defaultChannels() {
   const now = Date.now();
   return [
-    { id: "local", name: "本地执行", type: "local", enabled: true, priority: 1, weight: 100, endpoint: null, builtin: true, createdAt: now },
-    { id: "magpie", name: "Magpie 通道", type: "magpie", enabled: true, priority: 2, weight: 100, endpoint: process.env.MAGPIE_ENDPOINT || null, builtin: true, createdAt: now },
+    { id: "local", name: "本地执行", type: "local", enabled: true, priority: 1, weight: 100, concurrency: 0, endpoint: null, builtin: true, createdAt: now },
+    { id: "magpie", name: "Magpie 通道", type: "magpie", enabled: true, priority: 2, weight: 100, concurrency: 0, endpoint: process.env.MAGPIE_ENDPOINT || null, builtin: true, createdAt: now },
   ];
 }
 
@@ -46,5 +46,5 @@ export function routeChannel(channels) {
 
 export function newChannel({ name, type, priority, weight, endpoint }) {
   if (!CHANNEL_TYPES.includes(type)) throw new Error("channel type must be local or magpie");
-  return { id: randomUUID(), name: String(name || `${type} 通道`).slice(0, 64), type, enabled: true, priority: Number(priority) || 10, weight: Number(weight) || 100, endpoint: endpoint ? String(endpoint).slice(0, 512) : null, builtin: false, createdAt: Date.now() };
+  return { id: randomUUID(), name: String(name || `${type} 通道`).slice(0, 64), type, enabled: true, priority: Number(priority) || 10, weight: Number(weight) || 100, concurrency: 0, endpoint: endpoint ? String(endpoint).slice(0, 512) : null, builtin: false, createdAt: Date.now() };
 }

@@ -15,13 +15,38 @@ function search(){
   const q=(document.getElementById("q")||{}).value||"";
   render(VIDEOS.filter(v=>!q||v.title.includes(q)||v.author.includes(q)));
 }
+// 搜索防抖 300ms；按 / 聚焦搜索框（不在输入框里时）。
+(function(){
+  const input=document.getElementById("q");
+  if(input){
+    let timer=null;
+    input.addEventListener("input",()=>{ clearTimeout(timer); timer=setTimeout(search,300); });
+    document.addEventListener("keydown",(e)=>{
+      if(e.key==="/" && document.activeElement!==input){ e.preventDefault(); input.focus(); }
+    });
+  }
+})();
 if(document.getElementById("grid")) render(VIDEOS);
 const id=new URLSearchParams(location.search).get("id");
 if(id){
   const v=VIDEOS.find(x=>x.id===id)||VIDEOS[0];
   const t=document.getElementById("vtitle"); if(t) t.textContent=v.title;
   const d=document.getElementById("vdesc"); if(d) d.textContent=v.desc;
-  const vid=document.getElementById("player"); if(vid) vid.src=SAMPLE;
+  const vid=document.getElementById("player");
+  if(vid){
+    vid.src=SAMPLE;
+    // 观看进度只存在你自己的浏览器里，刷新后可续看；不上传、不代刷。
+    const pkey="molatube_progress_"+v.id;
+    const saved=Number(localStorage.getItem(pkey)||0);
+    const prog=document.getElementById("vprogress");
+    vid.addEventListener("loadedmetadata",()=>{ if(saved>10 && saved<vid.duration) vid.currentTime=saved; });
+    let lastSave=0;
+    vid.addEventListener("timeupdate",()=>{
+      const now=Date.now();
+      if(now-lastSave>5000){ lastSave=now; localStorage.setItem(pkey,String(Math.floor(vid.currentTime))); }
+      if(prog) prog.textContent=`已看到 ${Math.floor(vid.currentTime/60)}:${String(Math.floor(vid.currentTime%60)).padStart(2,"0")}（只保存在你的浏览器里）`;
+    });
+  }
   const sel=document.getElementById("jobVideo");
   if(sel) sel.innerHTML=VIDEOS.map(x=>`<option value="${x.id}" ${x.id===v.id?"selected":""}>${x.title}</option>`).join("");
 }
